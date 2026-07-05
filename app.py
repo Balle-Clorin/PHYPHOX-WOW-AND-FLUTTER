@@ -278,6 +278,8 @@ try:
     # ------------------------------------------------------------------------
     # PLOT
     # ------------------------------------------------------------------------
+    plt.close("all")  # safety: clear any figure left over from a prior rerun
+                       # that errored out before reaching its own plt.close()
     plt.style.use("dark_background")
     fig = plt.figure(figsize=(17, 12.5))
     gs = GridSpec(3, 2, figure=fig, height_ratios=[1, 1, 1])
@@ -378,6 +380,9 @@ try:
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     st.pyplot(fig)
+    plt.close(fig)  # release the figure immediately — without this, matplotlib
+                     # keeps every figure from every rerun alive in memory for
+                     # the lifetime of the server process
 
     st.caption(
         "DIN/IEC/AES6 weighting filter: analog pole/zero transfer function from the "
