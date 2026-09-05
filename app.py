@@ -83,7 +83,7 @@ STEADY_EDGE_TRIM_S = st.sidebar.number_input(
 st.sidebar.subheader("Filtering")
 VISUAL_LOWPASS_CUTOFF_HZ = st.sidebar.number_input(
     "Visual smoothing cutoff (Hz, plot only)", min_value=0.5, max_value=50.0,
-    value=5.0, step=0.5)
+    value=20.0, step=0.5)
 
 analysis_cutoff_enabled = st.sidebar.checkbox(
     "Apply analysis low-pass cutoff", value=True,
@@ -327,13 +327,50 @@ try:
     wow_rms_weighted_pct = _bandpass_rms(rpm_dev_weighted, fs, *WOW_BAND_HZ)
     flutter_rms_weighted_pct = _bandpass_rms(rpm_dev_weighted, fs, *FLUTTER_BAND_HZ)
 
-    # FFT of deviation
+    # FFT of the deviation signal.
+    #
+    # TWO separate quantities are computed here, deliberately kept apart:
+    #   fft_mag — plain coherent-gain-corrected AMPLITUDE spectrum, in %.
+    #             This is what the summary panel's numeric readings
+    #             (once/twice-per-rev, dominant peak) are read from, so
+    #             those numbers reflect the actual tone amplitude and do
+    #             NOT change based on how the FFT plot displays its y-axis.
+    #   fft_asd — one-sided AMPLITUDE SPECTRAL DENSITY, units %RMS/√Hz,
+    #             used ONLY for the FFT plot's y-axis. This is the
+    #             standard convention used by analog wow/flutter analyzers
+    #             (including Shaknspin's own spectrum, per its "Deviation
+    #             (% RMS/√Hz)" axis label) — normalized to the carrier RMS
+    #             and divided by the FFT bin's noise-equivalent bandwidth,
+    #             so a broadband noise floor reads consistently regardless
+    #             of capture duration or window choice. CAVEAT: that
+    #             "independent of length" property holds for broadband/
+    #             noise-like content, not for isolated discrete tones — a
+    #             pure tone's ASD reading grows roughly as 1/sqrt(bin
+    #             width) with longer captures. That's expected ASD
+    #             behavior, which is exactly why the summary panel's
+    #             numeric readings use fft_mag (plain amplitude) instead,
+    #             so they stay stable and comparable across capture
+    #             lengths.
     n = len(rpm_dev_pct)
     window = np.hanning(n)
+    window_coherent_gain = np.mean(window)  # Hanning ≈ 0.5 — correct for the
+                                              # window's amplitude suppression
+                                              # so fft_mag reads true % amplitude
+    sum_w2 = np.sum(window ** 2)  # window power, for the separate ASD normalization
+
     dev_windowed = (rpm_dev_pct - rpm_dev_pct.mean()) * window
     fft_vals = np.fft.rfft(dev_windowed)
     fft_freqs = np.fft.rfftfreq(n, d=1.0 / fs)
-    fft_mag = np.abs(fft_vals) / (n / 2)
+
+    # Plain amplitude spectrum (%) — drives all summary-panel numeric readings.
+    fft_mag = np.abs(fft_vals) / (n / 2) / window_coherent_gain
+
+    # One-sided PSD -> ASD (%RMS/√Hz) — used ONLY for the FFT plot's y-axis.
+    psd = (np.abs(fft_vals) ** 2) * (2.0 / (fs * sum_w2))
+    psd[0] /= 2.0
+    if n % 2 == 0:
+        psd[-1] /= 2.0
+    fft_asd = np.sqrt(psd)
 
     valid = fft_freqs > 0.05
     rev_freq = rpm_mean / 60.0
@@ -404,7 +441,7 @@ try:
 
     ax4 = fig.add_subplot(gs[2, 0])
     plot_mask = fft_freqs > 0
-    ax4.plot(fft_freqs[plot_mask], fft_mag[plot_mask], color="#00e0a0", linewidth=2.0)
+    ax4.plot(fft_freqs[plot_mask], fft_asd[plot_mask], color="#00e0a0", linewidth=2.0)
     if f1 is not None:
         ax4.axvline(f1, color="yellow", linestyle="--", linewidth=0.8, label=f"1×rev ≈ {f1:.3f} Hz")
     if f2 is not None:
@@ -416,7 +453,7 @@ try:
     ax4.set_xticklabels([f"{v:g}" if v != nyq else f"{np.floor(v * 10) / 10:.1f}" for v in tick_vals])
     ax4.xaxis.set_minor_formatter(plt.NullFormatter())
     ax4.set_xlabel("Frequency (Hz)")
-    ax4.set_ylabel("Deviation amplitude (%)")
+    ax4.set_ylabel("Deviation ASD (%RMS/√Hz)")
     ax4.set_title("FFT of speed deviation")
     ax4.legend(loc="best", fontsize=17)
     ax4.grid(alpha=0.2, which="both")
