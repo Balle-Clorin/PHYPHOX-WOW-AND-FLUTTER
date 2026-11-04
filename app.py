@@ -11,12 +11,14 @@ Deploy on Streamlit Community Cloud:
     2. share.streamlit.io -> New app -> point at this file
 """
 
+import gc
 from io import StringIO
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+from scipy.integrate import cumulative_trapezoid
 from scipy.signal import butter, filtfilt
 import streamlit as st
 
@@ -195,6 +197,23 @@ def centroid_peak(freqs, mags, f_lo, f_hi):
 # ----------------------------------------------------------------------------
 # MAIN ANALYSIS
 # ----------------------------------------------------------------------------
+REQUIRED_COLS = ["Time (s)", "Gyroscope x (rad/s)", "Gyroscope y (rad/s)",
+                 "Gyroscope z (rad/s)"]
+
+
+@st.cache_data(show_spinner=False, max_entries=1)
+def load_csv(file_bytes):
+    """Parse the CSV once per uploaded file (not on every sidebar change).
+    max_entries=1 keeps only the current file's data in the cache."""
+    df = pd.read_csv(StringIO(file_bytes.decode("utf-8", errors="replace")))
+    df.columns = [c.strip() for c in df.columns]
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        return None, (f"Missing expected column(s): {missing}. "
+                      f"Columns found: {list(df.columns)}")
+    return df[REQUIRED_COLS].astype(float).reset_index(drop=True), None
+
+
 if uploaded_file is None:
     st.info("Upload a Phyphox gyroscope CSV export to begin. Expected columns: "
             "\"Time (s)\", \"Gyroscope x (rad/s)\", \"Gyroscope y (rad/s)\", "
@@ -202,16 +221,9 @@ if uploaded_file is None:
     st.stop()
 
 try:
-    raw_bytes = uploaded_file.getvalue().decode("utf-8", errors="replace")
-    df = pd.read_csv(StringIO(raw_bytes))
-    df.columns = [c.strip() for c in df.columns]
-
-    required_cols = ["Time (s)", "Gyroscope x (rad/s)", "Gyroscope y (rad/s)",
-                      "Gyroscope z (rad/s)"]
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        st.error(f"Missing expected column(s): {missing}. "
-                 f"Columns found: {list(df.columns)}")
+    df, parse_err = load_csv(uploaded_file.getvalue())
+    if parse_err:
+        st.error(parse_err)
         st.stop()
 
     t = df["Time (s)"].values
@@ -546,27 +558,31 @@ try:
     st.divider()
     st.subheader("Synthetic test-tone spectrum (wow/flutter sidebands)")
 
-    from scipy.integrate import cumulative_trapezoid
-
+    # MEMORY-SAFE VERSION: instead of synthesizing the carrier at 44.1 kHz
+    # for the whole capture (tens of millions of samples for long files,
+    # ~8 arrays of that size alive at once -> out-of-memory on reruns), work
+    # at complex baseband. The FM sidebands around the carrier are exactly
+    # the spectrum of exp(j*phi(t)), phi(t) = 2*pi*f_c * integral(dev dt).
+    # This runs at the gyro sample rate (a few hundred Hz), needs only
+    # kilobytes-to-megabytes, and gives the same sideband picture (the
+    # speed data has no content above its own Nyquist anyway).
     dev_frac = rpm_dev_pct / 100.0
-
-    duration2 = t_steady[-1] - t_steady[0]
     t_rel = t_steady - t_steady[0]
-    n_audio = int(duration2 * SYNTH_AUDIO_FS)
-    t_audio = np.arange(n_audio) / SYNTH_AUDIO_FS
 
-    dev_frac_audio = np.interp(t_audio, t_rel, dev_frac)
-    f_inst = CARRIER_FREQ_HZ * (1 + dev_frac_audio)
-    phase = 2 * np.pi * cumulative_trapezoid(f_inst, dx=1 / SYNTH_AUDIO_FS, initial=0)
-    synth_audio = np.cos(phase)
-
-    audio_window = np.hanning(n_audio)
-    spec2 = np.fft.rfft(synth_audio * audio_window)
-    spec_freqs = np.fft.rfftfreq(n_audio, d=1 / SYNTH_AUDIO_FS)
+    phi = 2 * np.pi * CARRIER_FREQ_HZ * cumulative_trapezoid(dev_frac, t_rel, initial=0)
+    z = np.exp(1j * phi)  # carrier itself removed (baseband)
+    z = z * np.hanning(len(z))
+    spec2 = np.fft.fftshift(np.fft.fft(z))
+    offset_hz = np.fft.fftshift(np.fft.fftfreq(len(z), d=1.0 / fs))
     spec_mag_db = 20 * np.log10(np.abs(spec2) / np.abs(spec2).max() + 1e-12)
+    spec_freqs = CARRIER_FREQ_HZ + offset_hz  # absolute frequency axis
 
-    band_mask2 = (spec_freqs > CARRIER_FREQ_HZ - CARRIER_SPAN_HZ) & \
-                 (spec_freqs < CARRIER_FREQ_HZ + CARRIER_SPAN_HZ)
+    span_eff = min(CARRIER_SPAN_HZ, nyq)
+    band_mask2 = np.abs(offset_hz) < span_eff
+    if span_eff < CARRIER_SPAN_HZ:
+        st.caption(f"Sideband view limited to ±{nyq:.0f} Hz (the gyro's Nyquist "
+                   f"frequency) — the speed data contains nothing beyond that.")
+    del phi, z
 
     plt.close("all")
     fig2 = plt.figure(figsize=(22, 12))
@@ -675,6 +691,7 @@ try:
     plt.subplots_adjust(top=0.88, bottom=0.07, left=0.08, right=0.97, hspace=0.45)
     st.pyplot(fig3)
     plt.close(fig3)
+    gc.collect()
 
 except Exception as e:
     st.error(f"Error processing file: {e}")
